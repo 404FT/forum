@@ -2,7 +2,7 @@
 // @name         Shikimori Threaded Forum
 // @namespace    gnt.shikimori
 // @license      MIT
-// @version      1.5.1
+// @version      1.6.0
 // @description  Нативные ветки комментариев Shikimori
 // @homepageURL  https://github.com/404FT/forum
 // @supportURL   https://github.com/404FT/forum/issues
@@ -28,10 +28,60 @@ const Config = Object.freeze({
   ttl: 900000,
   maxComments: 500,
   branchPage: 30,
+  visibleRoots: 10,
+  forumRoots: 3,
+  visibleReplies: 3,
+  visibleDepth: 3,
   maxRetryDelay: 10000,
 });
 const SUPPORTED_HOSTS = ['shikimori.io', 'shikimori.one', 'shikimori.rip'];
 const KEY = 'gnt-mode';
+const SETTINGS_KEY = 'gnt-settings-v1';
+function normalizeSettings(value = {}) {
+  if (!value || typeof value !== 'object') value = {};
+  const number = (key, fallback, max, min = 1) => {
+    const n = Number(value[key]);
+    return Number.isInteger(n) && n >= min && n <= max ? n : fallback;
+  };
+  const settings = {
+    initial: number('initial', Config.initial, 100),
+    maxDepth: number('maxDepth', Config.maxDepth, 20),
+    maxAncestors: number('maxAncestors', Config.maxAncestors, 100, 0),
+    maxExtraRequests: number('maxExtraRequests', Config.maxExtraRequests, 100, 0),
+    concurrency: number('concurrency', Config.concurrency, 4),
+    timeout: number('timeout', Config.timeout, 60000, 1000),
+    retries: number('retries', Config.retries, 5, 0),
+    ttl: number('ttl', Config.ttl, 86400000, 1000),
+    maxComments: number('maxComments', Config.maxComments, 500),
+    branchPage: number('branchPage', Config.branchPage, 100),
+    maxRetryDelay: number('maxRetryDelay', Config.maxRetryDelay, 60000, 0),
+    visibleRoots: number('visibleRoots', Config.visibleRoots, 100),
+    forumRoots: number('forumRoots', Config.forumRoots, 100),
+    visibleReplies: number('visibleReplies', Config.visibleReplies, 100),
+    visibleDepth: number('visibleDepth', Config.visibleDepth, 20),
+    forumCollapsed: typeof value.forumCollapsed === 'boolean' ? value.forumCollapsed : true,
+    defaultSort: ['new', 'activity', 'count'].includes(value.defaultSort)
+      ? value.defaultSort
+      : 'new',
+    defaultFilter: ['all', 'mine', 'mentions', 'either'].includes(value.defaultFilter)
+      ? value.defaultFilter
+      : 'all',
+    defaultMode: ['remember', 'tree', 'chronology'].includes(value.defaultMode)
+      ? value.defaultMode
+      : 'remember',
+    autoMultiple: typeof value.autoMultiple === 'boolean' ? value.autoMultiple : false,
+    railToggle: typeof value.railToggle === 'boolean' ? value.railToggle : true,
+  };
+  settings.initial = Math.min(settings.initial, settings.maxComments);
+  return settings;
+}
+function readSettings() {
+  try {
+    return normalizeSettings(JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}'));
+  } catch {
+    return normalizeSettings();
+  }
+}
 function preference() {
   try {
     return localStorage.getItem(KEY) === 'tree' ? 'tree' : 'chronology';
@@ -94,7 +144,7 @@ class RequestPool {
     }
   }
 }
-const requestPool = new RequestPool();
+const requestPool = new RequestPool(readSettings().concurrency);
 function retryDelay(header, attempt, now = Date.now()) {
   let requested = 0;
   if (header !== null && header !== undefined) {
@@ -169,11 +219,15 @@ class API {
   }
 }
 class Cache extends Map {
+  constructor(entries, limit = Config.maxComments) {
+    super(entries);
+    this.limit = limit;
+  }
   put(comment) {
     if (!Number.isSafeInteger(comment.id) || comment.id <= 0) return;
     this.delete(comment.id);
     this.set(comment.id, { ...comment, gntTime: Date.now() });
-    while (this.size > Config.maxComments) this.delete(this.keys().next().value);
+    while (this.size > this.limit) this.delete(this.keys().next().value);
   }
 }
 // Inspect the rendered body when available: nested citations and reverse replies
@@ -182,6 +236,7 @@ function htmlRelations(html) {
   const root = new DOMParser().parseFromString(html, 'text/html').body;
   root.querySelectorAll('.b-replies, pre, code, .b-code, script, style').forEach((n) => n.remove());
   const references = [],
+    mentionIds = [],
     quotes = [];
   const textOf = (node) => {
     node.querySelectorAll('br').forEach((n) => n.replaceWith(' '));
@@ -209,13 +264,21 @@ function htmlRelations(html) {
   }
   for (const link of root.querySelectorAll('a[href]')) {
     if (link.closest('.b-quote, .b-quote-v2')) continue;
+    if (link.matches('a.b-mention')) {
+      try {
+        const id = Number(JSON.parse(link.dataset.attrs || '{}').userId);
+        if (Number.isSafeInteger(id) && id > 0 && !mentionIds.includes(id)) mentionIds.push(id);
+      } catch {
+        /* Ignore malformed mention metadata. */
+      }
+    }
     add(
       link.matches('a.b-mention') ? mentionId(link) : commentId(link.getAttribute('href')),
       'reference',
     );
   }
   root.querySelectorAll('.b-quote, .b-quote-v2').forEach((n) => n.remove());
-  return { references, quotes, ownText: textOf(root) };
+  return { references, quotes, mentionIds, ownText: textOf(root) };
 }
 
 // Keep all explicit targets; tree placement remains an inference.
@@ -401,6 +464,55 @@ function graphFor(cache) {
       .map((c) => c.id),
   };
 }
+function orderThreads(cache, graph, sort = 'new', filter = 'all', user = null) {
+  const time = (id) => Date.parse(cache.get(id)?.created_at) || 0;
+  const stats = graph.roots.map((id) => {
+    const seen = new Set(),
+      pending = [id];
+    let activity = 0,
+      mine = false,
+      mentioned = false;
+    while (pending.length) {
+      const current = pending.pop();
+      if (seen.has(current)) continue;
+      seen.add(current);
+      const c = cache.get(current);
+      activity = Math.max(activity, time(current));
+      if (user && c) {
+        mine ||=
+          (user.id && Number(c.user?.id) === Number(user.id)) ||
+          Boolean(user.nickname && c.user?.nickname?.toLowerCase() === user.nickname.toLowerCase());
+        const mentions =
+          c.mentionIds ||
+          (typeof DOMParser !== 'undefined' && c.html_body
+            ? htmlRelations(c.html_body).mentionIds
+            : []);
+        mentioned ||= mentions.includes(Number(user.id));
+      }
+      pending.push(...(graph.children.get(current) || []));
+    }
+    return { id, activity, count: seen.size - 1, mine, mentioned };
+  });
+  return stats
+    .filter(
+      (s) =>
+        filter === 'all' ||
+        (filter === 'mine' && s.mine) ||
+        (filter === 'mentions' && s.mentioned) ||
+        (filter === 'either' && (s.mine || s.mentioned)),
+    )
+    .sort(
+      (a, b) =>
+        (sort === 'activity'
+          ? b.activity - a.activity
+          : sort === 'count'
+            ? b.count - a.count
+            : 0) ||
+        time(b.id) - time(a.id) ||
+        b.id - a.id,
+    )
+    .map((s) => s.id);
+}
 function clean(html) {
   const document = new DOMParser().parseFromString(
     typeof html === 'string' ? html : '',
@@ -467,7 +579,7 @@ function nativeUrl(descriptor, skip, limit) {
   return url.href;
 }
 
-const STYLES = ".gnt-toolbar,\n.gnt-tree,\n.gnt-more {\n  --gnt-accent: var(--my-clr, var(--link-color, #5292d2));\n  --gnt-line: color-mix(in srgb, currentColor 15%, transparent);\n  --gnt-tint: color-mix(in srgb, currentColor 4%, transparent);\n}\n.gnt-toolbar {\n  margin: 18px 0 14px;\n  display: flex;\n  align-items: center;\n  gap: 10px 16px;\n  flex-wrap: wrap;\n}\n.gnt-heading.subheadline {\n  flex-basis: 100%;\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 12px;\n  margin: 0;\n  padding-inline-end: 10px;\n}\n.gnt-summary {\n  font: normal 11px/1.5 var(--font-main, Arial, sans-serif);\n  text-transform: none;\n  letter-spacing: normal;\n  color: var(--txt-secondary-dark, inherit);\n  white-space: nowrap;\n}\n.gnt-modes {\n  display: inline-flex;\n  gap: 0;\n  border-bottom: 1px solid var(--gnt-line);\n}\n.gnt-toolbar .gnt-modes .gnt-button {\n  background: transparent;\n  color: inherit;\n  border: 0;\n  border-bottom: 2px solid transparent;\n  border-radius: 0;\n  box-shadow: none;\n  font: inherit;\n  line-height: 28px;\n  padding: 2px 14px;\n  margin: 0;\n  min-height: 34px;\n  cursor: pointer;\n}\n.gnt-toolbar .gnt-modes .gnt-button[aria-pressed='true'] {\n  color: var(--gnt-accent);\n  border-bottom-color: currentColor;\n  font-weight: bold;\n}\n.gnt-toolbar .gnt-modes .gnt-button:hover {\n  color: var(--gnt-accent);\n  background: var(--gnt-tint);\n}\n.gnt-status {\n  font-size: 11px;\n  opacity: 0.7;\n  line-height: 1.6;\n}\n.gnt-toolbar[data-gnt-mode='chronology'] .gnt-status:empty {\n  display: none;\n}\n.gnt-loading .gnt-status::before {\n  content: '';\n  display: inline-block;\n  width: 8px;\n  height: 8px;\n  margin-inline-end: 7px;\n  border: 1px solid currentColor;\n  border-top-color: transparent;\n  border-radius: 50%;\n  animation: gnt-spin 0.8s linear infinite;\n}\n.gnt-branch {\n  position: relative;\n  min-width: 0;\n  border-inline-start: 1px solid var(--gnt-line);\n  padding-inline-start: 12px;\n  scroll-margin-top: calc(var(--top-menu-height, 46px) + 18px);\n}\n.gnt-tree > .gnt-branch {\n  border-inline-start: 0;\n  padding-inline-start: 0;\n  margin-bottom: 22px;\n}\n.gnt-branch > .gnt-branch {\n  margin-top: 12px;\n}\n.gnt-branch > .gnt-branch::before {\n  content: '';\n  position: absolute;\n  inset-inline-start: 0;\n  top: 18px;\n  width: 7px;\n  border-top: 1px solid var(--gnt-line);\n}\n.gnt-tree .gnt-branch > .b-comment {\n  margin-bottom: 0;\n  padding-bottom: 0;\n  overflow-wrap: anywhere;\n  min-width: 0;\n}\n.gnt-tools {\n  display: flex;\n  align-items: center;\n  gap: 6px 12px;\n  flex-wrap: wrap;\n  min-height: 26px;\n  margin: 3px 0 6px;\n  padding-inline-start: 48px;\n  font-size: 11px;\n  line-height: 1.6;\n  color: var(--txt-secondary-dark, inherit);\n}\n.gnt-tools .gnt-action.b-button {\n  display: inline-block;\n  background: transparent;\n  border: 0;\n  box-shadow: none;\n  padding: 2px 0;\n  margin: 0;\n  border-radius: 0;\n  color: inherit;\n  font: inherit;\n  line-height: 20px;\n  cursor: pointer;\n}\n.gnt-tools .gnt-action:hover,\n.gnt-tools a:hover {\n  color: var(--gnt-accent);\n}\n.gnt-relation,\n.gnt-depth,\n.gnt-missing {\n  font-size: 10px;\n  opacity: 0.65;\n}\n.gnt-relation {\n  border-bottom: 1px dotted currentColor;\n  cursor: help;\n}\n.gnt-permalink {\n  margin-inline-start: auto;\n  opacity: 0.65;\n}\n.gnt-tree .gnt-branch > .b-comment {\n  border-bottom-color: var(--gnt-line);\n}\n.gnt-tree img {\n  max-width: 100%;\n}\n.gnt-selected > .b-comment {\n  background: color-mix(in srgb, var(--gnt-accent) 12%, transparent);\n  outline: 1px solid color-mix(in srgb, var(--gnt-accent) 40%, transparent);\n  outline-offset: 4px;\n}\n.gnt-more.b-button {\n  display: block;\n  width: 100%;\n  box-sizing: border-box;\n  margin: 18px 0;\n  text-align: center;\n  cursor: pointer;\n  font: inherit;\n  line-height: 32px;\n}\n.gnt-tree[hidden],\n.gnt-more[hidden] {\n  display: none !important;\n}\n.gnt-button:focus-visible,\n.gnt-tools a:focus-visible {\n  outline: 2px solid var(--gnt-accent);\n  outline-offset: 3px;\n}\n@keyframes gnt-spin {\n  to {\n    transform: rotate(360deg);\n  }\n}\n@media (max-width: 600px) {\n  .gnt-toolbar {\n    gap: 8px;\n    margin-top: 12px;\n  }\n  .gnt-heading.subheadline {\n    gap: 6px;\n    flex-wrap: wrap;\n  }\n  .gnt-summary {\n    font-size: 10px;\n  }\n  .gnt-status {\n    flex-basis: 100%;\n  }\n  .gnt-branch {\n    padding-inline-start: 5px;\n  }\n  .gnt-branch > .gnt-branch::before {\n    width: 3px;\n  }\n  .gnt-tools {\n    padding-inline-start: 0;\n    gap: 3px 10px;\n  }\n  .gnt-tools .gnt-action {\n    min-height: 28px;\n  }\n  .gnt-relation {\n    display: none;\n  }\n  .gnt-tree > .gnt-branch {\n    margin-bottom: 18px;\n  }\n}\n@media (prefers-reduced-motion: reduce) {\n  .gnt-loading .gnt-status::before {\n    animation: none;\n  }\n}\n\n/* Readability: strong rails, clear root boundaries, comfortable text. */\n.gnt-tree {\n  --gnt-rail: color-mix(in srgb, var(--gnt-accent) 65%, currentColor 35%);\n}\n.gnt-tree > .gnt-branch {\n  border-inline-start: 4px solid var(--gnt-rail);\n  border-top: 1px solid var(--gnt-line);\n  padding: 16px 12px 12px 16px;\n  margin-block: 0 28px;\n  background: var(--gnt-tint);\n}\n.gnt-branch > .gnt-branch {\n  border-inline-start: 3px solid color-mix(in srgb, var(--gnt-rail) 65%, transparent);\n  padding-inline-start: 15px;\n  margin-top: 18px;\n  padding-top: 8px;\n}\n.gnt-branch > .gnt-branch::before {\n  top: 25px;\n  width: 10px;\n  border-top: 3px solid color-mix(in srgb, var(--gnt-rail) 65%, transparent);\n}\n.gnt-branch > .gnt-branch:hover {\n  border-inline-start-color: var(--gnt-rail);\n}\n.gnt-tree .gnt-branch > .b-comment {\n  border-bottom: 0;\n  padding-bottom: 6px;\n}\n.gnt-tree .b-comment > .inner > .body,\n.gnt-tree .b-comment > .body {\n  font-size: 14px;\n  line-height: 1.75;\n  margin-top: 10px;\n}\n.gnt-tree .b-comment header .name {\n  font-size: 14px;\n  font-weight: bold;\n}\n.gnt-tools {\n  border-top: 1px solid var(--gnt-line);\n  padding-top: 5px;\n  margin-top: 6px;\n  gap: 6px 14px;\n  font-size: 12px;\n  min-height: 30px;\n}\n.gnt-tools .gnt-action.b-button {\n  line-height: 24px;\n  padding: 2px 6px;\n  background: var(--gnt-tint);\n  border-radius: 3px;\n}\n.gnt-tools .gnt-action:hover {\n  background: color-mix(in srgb, var(--gnt-accent) 13%, transparent);\n}\n.gnt-parent {\n  font-weight: bold;\n}\n.gnt-relation {\n  opacity: 0.8;\n}\n.gnt-tree .gnt-copy-label,\n.gnt-tree .gnt-inferred {\n  display: inline;\n}\n.gnt-permalink {\n  opacity: 0.8;\n}\n.gnt-selected > .b-comment {\n  outline: 2px solid var(--gnt-rail);\n  outline-offset: 5px;\n}\n@media (max-width: 600px) {\n  .gnt-tree > .gnt-branch {\n    padding: 12px 7px 8px 9px;\n    border-inline-start-width: 4px;\n    margin-bottom: 22px;\n  }\n  .gnt-branch > .gnt-branch {\n    padding-inline-start: 7px;\n    border-inline-start-width: 3px;\n    margin-top: 15px;\n  }\n  .gnt-branch > .gnt-branch::before {\n    width: 4px;\n  }\n  .gnt-tree .b-comment > .inner > .body,\n  .gnt-tree .b-comment > .body {\n    font-size: 14px;\n    line-height: 1.7;\n  }\n  .gnt-tools {\n    gap: 5px 10px;\n  }\n  .gnt-tools .gnt-action.b-button {\n    min-height: 30px;\n  }\n}\n\n/* Stop all horizontal nesting, including borders and padding, after the cap. */\n.gnt-branch.gnt-deep {\n  padding-inline-start: 0;\n  border-inline-start: 0;\n}\n.gnt-branch.gnt-deep::before {\n  display: none;\n}\n\n.gnt-top-actions {\n  display: flex;\n  gap: 8px;\n  flex-wrap: wrap;\n  margin-inline-start: auto;\n}\n.gnt-top-actions .gnt-button {\n  font: inherit;\n  line-height: 28px;\n  padding: 0 10px;\n  margin: 0;\n  cursor: pointer;\n}\n.gnt-top-actions[hidden],\n.gnt-top-actions [hidden] {\n  display: none !important;\n}\n@media (max-width: 600px) {\n  .gnt-top-actions {\n    margin-inline-start: 0;\n    flex-basis: 100%;\n  }\n  .gnt-top-actions .gnt-button {\n    min-height: 34px;\n  }\n}\n";
+const STYLES = ".gnt-toolbar,\n.gnt-tree,\n.gnt-more {\n  --gnt-accent: var(--my-clr, var(--link-color, #5292d2));\n  --gnt-line: color-mix(in srgb, currentColor 15%, transparent);\n  --gnt-tint: color-mix(in srgb, currentColor 4%, transparent);\n}\n.gnt-toolbar {\n  margin: 18px 0 14px;\n  display: flex;\n  align-items: center;\n  gap: 10px 16px;\n  flex-wrap: wrap;\n}\n.gnt-heading.subheadline {\n  flex-basis: 100%;\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 12px;\n  margin: 0;\n  padding-inline-end: 10px;\n}\n.gnt-summary {\n  font: normal 11px/1.5 var(--font-main, Arial, sans-serif);\n  text-transform: none;\n  letter-spacing: normal;\n  color: var(--txt-secondary-dark, inherit);\n  white-space: nowrap;\n}\n.gnt-modes {\n  display: inline-flex;\n  gap: 0;\n  border-bottom: 1px solid var(--gnt-line);\n}\n.gnt-toolbar .gnt-modes .gnt-button {\n  background: transparent;\n  color: inherit;\n  border: 0;\n  border-bottom: 2px solid transparent;\n  border-radius: 0;\n  box-shadow: none;\n  font: inherit;\n  line-height: 28px;\n  padding: 2px 14px;\n  margin: 0;\n  min-height: 34px;\n  cursor: pointer;\n}\n.gnt-toolbar .gnt-modes .gnt-button[aria-pressed='true'] {\n  color: var(--gnt-accent);\n  border-bottom-color: currentColor;\n  font-weight: bold;\n}\n.gnt-toolbar .gnt-modes .gnt-button:hover {\n  color: var(--gnt-accent);\n  background: var(--gnt-tint);\n}\n.gnt-status {\n  font-size: 11px;\n  opacity: 0.7;\n  line-height: 1.6;\n}\n.gnt-toolbar[data-gnt-mode='chronology'] .gnt-status:empty {\n  display: none;\n}\n.gnt-loading .gnt-status::before {\n  content: '';\n  display: inline-block;\n  width: 8px;\n  height: 8px;\n  margin-inline-end: 7px;\n  border: 1px solid currentColor;\n  border-top-color: transparent;\n  border-radius: 50%;\n  animation: gnt-spin 0.8s linear infinite;\n}\n.gnt-branch {\n  position: relative;\n  min-width: 0;\n  border-inline-start: 1px solid var(--gnt-line);\n  padding-inline-start: 12px;\n  scroll-margin-top: calc(var(--top-menu-height, 46px) + 18px);\n}\n.gnt-tree > .gnt-branch {\n  border-inline-start: 0;\n  padding-inline-start: 0;\n  margin-bottom: 22px;\n}\n.gnt-branch > .gnt-branch {\n  margin-top: 12px;\n}\n.gnt-branch > .gnt-branch::before {\n  content: '';\n  position: absolute;\n  inset-inline-start: 0;\n  top: 18px;\n  width: 7px;\n  border-top: 1px solid var(--gnt-line);\n}\n.gnt-tree .gnt-branch > .b-comment {\n  margin-bottom: 0;\n  padding-bottom: 0;\n  overflow-wrap: anywhere;\n  min-width: 0;\n}\n.gnt-tools {\n  display: flex;\n  align-items: center;\n  gap: 6px 12px;\n  flex-wrap: wrap;\n  min-height: 26px;\n  margin: 3px 0 6px;\n  padding-inline-start: 48px;\n  font-size: 11px;\n  line-height: 1.6;\n  color: var(--txt-secondary-dark, inherit);\n}\n.gnt-tools .gnt-action.b-button {\n  display: inline-block;\n  background: transparent;\n  border: 0;\n  box-shadow: none;\n  padding: 2px 0;\n  margin: 0;\n  border-radius: 0;\n  color: inherit;\n  font: inherit;\n  line-height: 20px;\n  cursor: pointer;\n}\n.gnt-tools .gnt-action:hover,\n.gnt-tools a:hover {\n  color: var(--gnt-accent);\n}\n.gnt-relation,\n.gnt-depth,\n.gnt-missing {\n  font-size: 10px;\n  opacity: 0.65;\n}\n.gnt-relation {\n  border-bottom: 1px dotted currentColor;\n  cursor: help;\n}\n.gnt-permalink {\n  margin-inline-start: auto;\n  opacity: 0.65;\n}\n.gnt-tree .gnt-branch > .b-comment {\n  border-bottom-color: var(--gnt-line);\n}\n.gnt-tree img {\n  max-width: 100%;\n}\n.gnt-selected > .b-comment {\n  background: color-mix(in srgb, var(--gnt-accent) 12%, transparent);\n  outline: 1px solid color-mix(in srgb, var(--gnt-accent) 40%, transparent);\n  outline-offset: 4px;\n}\n.gnt-more.b-button {\n  display: block;\n  width: 100%;\n  box-sizing: border-box;\n  margin: 18px 0;\n  text-align: center;\n  cursor: pointer;\n  font: inherit;\n  line-height: 32px;\n}\n.gnt-tree[hidden],\n.gnt-more[hidden] {\n  display: none !important;\n}\n.gnt-button:focus-visible,\n.gnt-tools a:focus-visible {\n  outline: 2px solid var(--gnt-accent);\n  outline-offset: 3px;\n}\n@keyframes gnt-spin {\n  to {\n    transform: rotate(360deg);\n  }\n}\n@media (max-width: 600px) {\n  .gnt-toolbar {\n    gap: 8px;\n    margin-top: 12px;\n  }\n  .gnt-heading.subheadline {\n    gap: 6px;\n    flex-wrap: wrap;\n  }\n  .gnt-summary {\n    font-size: 10px;\n  }\n  .gnt-status {\n    flex-basis: 100%;\n  }\n  .gnt-branch {\n    padding-inline-start: 5px;\n  }\n  .gnt-branch > .gnt-branch::before {\n    width: 3px;\n  }\n  .gnt-tools {\n    padding-inline-start: 0;\n    gap: 3px 10px;\n  }\n  .gnt-tools .gnt-action {\n    min-height: 28px;\n  }\n  .gnt-relation {\n    display: none;\n  }\n  .gnt-tree > .gnt-branch {\n    margin-bottom: 18px;\n  }\n}\n@media (prefers-reduced-motion: reduce) {\n  .gnt-loading .gnt-status::before {\n    animation: none;\n  }\n}\n\n/* Readability: strong rails, clear root boundaries, comfortable text. */\n.gnt-tree {\n  --gnt-rail: color-mix(in srgb, var(--gnt-accent) 65%, currentColor 35%);\n}\n.gnt-rail-toggle.b-button {\n  position: absolute;\n  inset-block: 0;\n  inset-inline-start: -8px;\n  width: 16px;\n  padding: 0;\n  margin: 0;\n  border: 0;\n  background: transparent;\n  box-shadow: none;\n  cursor: pointer;\n  z-index: 1;\n}\n.gnt-rail-toggle.b-button:hover,\n.gnt-rail-toggle.b-button:focus-visible {\n  background: color-mix(in srgb, var(--gnt-accent) 22%, transparent);\n}\n.gnt-tree > .gnt-branch {\n  border-inline-start: 4px solid var(--gnt-rail);\n  border-top: 1px solid var(--gnt-line);\n  padding: 16px 12px 12px 16px;\n  margin-block: 0 28px;\n  background: var(--gnt-tint);\n}\n.gnt-branch > .gnt-branch {\n  border-inline-start: 3px solid color-mix(in srgb, var(--gnt-rail) 65%, transparent);\n  padding-inline-start: 15px;\n  margin-top: 18px;\n  padding-top: 8px;\n}\n.gnt-branch > .gnt-branch::before {\n  top: 25px;\n  width: 10px;\n  border-top: 3px solid color-mix(in srgb, var(--gnt-rail) 65%, transparent);\n}\n.gnt-branch > .gnt-branch:hover {\n  border-inline-start-color: var(--gnt-rail);\n}\n.gnt-tree .gnt-branch > .b-comment {\n  border-bottom: 0;\n  padding-bottom: 6px;\n}\n.gnt-tree .b-comment > .inner > .body,\n.gnt-tree .b-comment > .body {\n  font-size: 14px;\n  line-height: 1.75;\n  margin-top: 10px;\n}\n.gnt-tree .b-comment header .name {\n  font-size: 14px;\n  font-weight: bold;\n}\n.gnt-tools {\n  border-top: 1px solid var(--gnt-line);\n  padding-top: 5px;\n  margin-top: 6px;\n  gap: 6px 14px;\n  font-size: 12px;\n  min-height: 30px;\n}\n.gnt-tools .gnt-action.b-button {\n  line-height: 24px;\n  padding: 2px 6px;\n  background: var(--gnt-tint);\n  border-radius: 3px;\n}\n.gnt-tools .gnt-action:hover {\n  background: color-mix(in srgb, var(--gnt-accent) 13%, transparent);\n}\n.gnt-parent {\n  font-weight: bold;\n}\n.gnt-relation {\n  opacity: 0.8;\n}\n.gnt-tree .gnt-copy-label,\n.gnt-tree .gnt-inferred {\n  display: inline;\n}\n.gnt-permalink {\n  opacity: 0.8;\n}\n.gnt-selected > .b-comment {\n  outline: 2px solid var(--gnt-rail);\n  outline-offset: 5px;\n}\n@media (max-width: 600px) {\n  .gnt-tree > .gnt-branch {\n    padding: 12px 7px 8px 9px;\n    border-inline-start-width: 4px;\n    margin-bottom: 22px;\n  }\n  .gnt-branch > .gnt-branch {\n    padding-inline-start: 7px;\n    border-inline-start-width: 3px;\n    margin-top: 15px;\n  }\n  .gnt-branch > .gnt-branch::before {\n    width: 4px;\n  }\n  .gnt-tree .b-comment > .inner > .body,\n  .gnt-tree .b-comment > .body {\n    font-size: 14px;\n    line-height: 1.7;\n  }\n  .gnt-tools {\n    gap: 5px 10px;\n  }\n  .gnt-tools .gnt-action.b-button {\n    min-height: 30px;\n  }\n}\n\n/* Stop all horizontal nesting, including borders and padding, after the cap. */\n.gnt-branch.gnt-deep {\n  padding-inline-start: 0;\n  border-inline-start: 0;\n}\n.gnt-branch.gnt-deep::before {\n  display: none;\n}\n\n.gnt-top-actions {\n  display: flex;\n  gap: 8px;\n  flex-wrap: wrap;\n  margin-inline-start: auto;\n}\n.gnt-options {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 8px 16px;\n  flex-basis: 100%;\n  font-size: 12px;\n}\n.gnt-options[hidden] {\n  display: none;\n}\n.gnt-option select {\n  font: inherit;\n  max-width: 100%;\n}\n.gnt-options-note {\n  opacity: 0.7;\n}\n/* Keep the controls aligned with the site's own colors and typography. */\n.gnt-toolbar {\n  gap: 0;\n}\n.gnt-heading.subheadline {\n  margin-bottom: 10px;\n}\n.gnt-modes {\n  margin-bottom: 8px;\n}\n.gnt-options {\n  border-top: 1px solid var(--gnt-line);\n  border-bottom: 1px solid var(--gnt-line);\n  padding: 12px 0;\n  gap: 10px 18px;\n}\n.gnt-option {\n  display: inline-flex;\n  align-items: center;\n  gap: 8px;\n  font-size: 12px;\n  font-weight: 600;\n  white-space: nowrap;\n}\n.gnt-options .gnt-option select {\n  box-sizing: border-box;\n  color: inherit;\n  background-color: var(--block-color, transparent);\n  border: 1px solid color-mix(in srgb, currentColor 25%, transparent);\n  border-radius: 4px;\n  min-height: 34px;\n  min-width: 145px;\n  padding: 6px 28px 6px 10px;\n  font: inherit;\n  font-weight: normal;\n  cursor: pointer;\n}\n.gnt-options .gnt-option select:hover {\n  border-color: var(--gnt-accent);\n}\n.gnt-options .gnt-option select:focus-visible {\n  outline: 2px solid var(--gnt-accent);\n  outline-offset: 2px;\n}\n.gnt-options .gnt-option select:disabled {\n  opacity: 0.5;\n  cursor: default;\n}\n.gnt-options-note {\n  border-inline-start: 1px solid var(--gnt-line);\n  padding-inline-start: 16px;\n  line-height: 1.4;\n}\n@media (max-width: 600px) {\n  .gnt-options {\n    gap: 10px;\n  }\n  .gnt-option {\n    flex: 1 1 100%;\n    justify-content: space-between;\n  }\n  .gnt-options .gnt-option select {\n    width: min(65%, 260px);\n  }\n  .gnt-options-note {\n    border: 0;\n    padding: 0;\n  }\n}\n.gnt-status {\n  flex-basis: 100%;\n  padding-top: 8px;\n}\n.gnt-top-actions .gnt-button {\n  font: inherit;\n  line-height: 28px;\n  padding: 0 10px;\n  margin: 0;\n  cursor: pointer;\n}\n.gnt-top-actions[hidden],\n.gnt-top-actions [hidden] {\n  display: none !important;\n}\n.gnt-show-replies.b-button {\n  display: block;\n  background: transparent;\n  border: 0;\n  box-shadow: none;\n  color: var(--gnt-accent);\n  font: inherit;\n  padding: 8px 0 8px 48px;\n  cursor: pointer;\n  text-align: start;\n}\n@media (max-width: 600px) {\n  .gnt-top-actions {\n    margin-inline-start: 0;\n    flex-basis: 100%;\n  }\n  .gnt-top-actions .gnt-button {\n    min-height: 34px;\n  }\n}\n.gnt-settings[hidden] {\n  display: none !important;\n}\n.gnt-settings-form {\n  max-width: 550px;\n}\n.gnt-settings-row {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 15px;\n  padding: 10px 0;\n  border-bottom: 1px solid var(--gnt-line, #ddd);\n}\n.gnt-settings-row input {\n  width: 110px;\n  padding: 5px;\n}\n.gnt-settings-group {\n  margin: 20px 0 6px;\n  font-size: 14px;\n}\n.gnt-settings-row select {\n  max-width: 55%;\n}\n.gnt-settings-check {\n  display: block;\n  margin: 16px 0;\n}\n.gnt-settings-form .b-button {\n  margin-inline-end: 8px;\n}\n.gnt-settings-hint,\n.gnt-settings-message {\n  font-size: 12px;\n  opacity: 0.8;\n}\n";
 const el = (tag, cls, text) => {
   const n = document.createElement(tag);
   if (cls) n.className = cls;
@@ -482,6 +594,11 @@ const button = (text, fn) => {
 };
 const sessions = new Map();
 let viewSequence = 0;
+// The site does not have this route. Load its profile settings shell on direct visits.
+const settingsRoute = location.pathname.match(/^(\/[^/]+\/edit\/)gnt-settings\/?$/);
+if (settingsRoute && !document.querySelector('.is-own-profile > .b-options-floated')) {
+  location.replace(settingsRoute[1] + 'profile#gnt-settings');
+}
 function describe(host) {
   const loader = [...host.querySelectorAll('[data-clickloaded-url-template]')].find(
     (n) => n.closest('.b-comments') === host,
@@ -518,21 +635,31 @@ class DiscussionView {
     this.route = location.pathname + location.search;
     this.host = host;
     this.ctrl = new AbortController();
-    this.api = new API(this.ctrl.signal);
-    this.cache = new Cache();
+    this.settings = readSettings();
+    this.api = new API(this.ctrl.signal, { config: this.settings });
+    this.cache = new Cache(undefined, this.settings.maxComments);
     this.nodes = new Map();
     this.moved = new Map();
     this.collapsed = new Set();
+    this.initializedRoots = new Set();
+    this.forumMode = /^\/forum(?:\/|$)/.test(location.pathname);
     this.pages = new Map();
+    this.expandedDepth = new Set();
+    this.rootLimit = this.forumMode ? this.settings.forumRoots : this.settings.visibleRoots;
     this.mode = 'chronology';
     this.ready = false;
     this.loading = false;
     this.ancestors = 0;
-    this.nextSkip = Config.initial;
+    this.nextSkip = this.settings.initial;
     this.needsAncestors = true;
     this.disposed = false;
     this.navigationId = null;
     this.parentErrors = new Map();
+    try {
+      this.currentUser = JSON.parse(document.body.dataset.user || 'null');
+    } catch {
+      this.currentUser = null;
+    }
     this.bar = el('div', 'gnt-toolbar');
     this.status = el('span', 'gnt-status');
     this.status.setAttribute('role', 'status');
@@ -555,10 +682,46 @@ class DiscussionView {
     this.jumpNew.hidden = true;
     this.topActions = el('div', 'gnt-top-actions');
     this.topActions.append(this.refresh, this.moreTop, this.jumpNew);
+    this.options = el('div', 'gnt-options');
+    const makeSelect = (label, choices) => {
+      const wrapper = el('label', 'gnt-option');
+      wrapper.append(document.createTextNode(label + ' '));
+      const select = el('select');
+      for (const [value, text] of choices) {
+        const option = el('option', '', text);
+        option.value = value;
+        select.append(option);
+      }
+      select.onchange = () => {
+        this.rootLimit = this.forumMode ? this.settings.forumRoots : this.settings.visibleRoots;
+        this.render();
+      };
+      wrapper.append(select);
+      this.options.append(wrapper);
+      return select;
+    };
+    this.sort = makeSelect('Сортировка:', [
+      ['new', 'Новые ветки'],
+      ['activity', 'Последняя активность'],
+      ['count', 'Больше ответов'],
+    ]);
+    this.filter = makeSelect('Показать:', [
+      ['all', 'Все ветки'],
+      ['mine', 'Я участвовал'],
+      ['mentions', 'Меня упоминали'],
+      ['either', 'Участие или упоминание'],
+    ]);
+    this.sort.value = this.settings.defaultSort;
+    this.filter.value = this.currentUser?.id ? this.settings.defaultFilter : 'all';
+    if (!this.currentUser?.id) {
+      this.filter.disabled = true;
+      this.filter.title = 'Для фильтра нужна авторизация';
+    }
+    this.options.append(el('span', 'gnt-options-note', 'По загруженным комментариям'));
     this.more = button('Загрузить старые', () => this.older());
     this.more.hidden = true;
     this.more.classList.add('gnt-more');
-    this.bar.append(this.heading, this.tabs, this.topActions, this.status);
+    this.bar.append(this.heading, this.tabs, this.options, this.status);
     host.before(this.bar);
     this.tree = el('div', 'gnt-tree b-comments');
     host.after(this.tree);
@@ -585,7 +748,12 @@ class DiscussionView {
       }
     };
     window.addEventListener('popstate', this.onPop, true);
-    this.switch(auto && preference() === 'tree' ? 'tree' : 'chronology', false);
+    const preferred =
+      this.settings.defaultMode === 'remember' ? preference() : this.settings.defaultMode;
+    this.switch(
+      (auto || this.settings.autoMultiple) && preferred === 'tree' ? 'tree' : 'chronology',
+      false,
+    );
   }
   valid(c) {
     return (
@@ -612,12 +780,12 @@ class DiscussionView {
     }
 
     const native = this.descriptor.template
-      ? await this.api.get(nativeUrl(this.descriptor, 0, Config.initial))
+      ? await this.api.get(nativeUrl(this.descriptor, 0, this.settings.initial))
       : { content: this.host.outerHTML };
     if (this.disposed) throw abortError();
     if (typeof native.content !== 'string') throw Error('Неожиданный формат HTML API');
-    this.ingest(native, Config.initial);
-    this.nextSkip = Config.initial;
+    this.ingest(native, this.settings.initial);
+    this.nextSkip = this.settings.initial;
     this.more.disabled = !this.descriptor.template;
     this.moreTop.disabled = this.more.disabled;
     this.ready = true;
@@ -647,7 +815,8 @@ class DiscussionView {
   }
 
   merge(c) {
-    if (!this.valid(c) || (!this.cache.has(c.id) && this.cache.size >= Config.maxComments)) return;
+    if (!this.valid(c) || (!this.cache.has(c.id) && this.cache.size >= this.settings.maxComments))
+      return;
     const old = this.cache.get(c.id);
     if (old && old.html_body !== c.html_body) {
       const node = this.nodes.get(c.id),
@@ -665,9 +834,9 @@ class DiscussionView {
     const fresh = [...this.host.querySelectorAll('.b-comment[id]')].some(
       (n) => !this.cache.has(Number(n.id)),
     );
-    if (!fresh || this.cache.size >= Config.maxComments) return;
+    if (!fresh || this.cache.size >= this.settings.maxComments) return;
     const known = new Set(this.cache.keys());
-    this.ingest({ content: this.host.outerHTML }, Config.maxComments);
+    this.ingest({ content: this.host.outerHTML }, this.settings.maxComments);
     const added = [...this.cache.keys()].filter((id) => !known.has(id));
     if (!added.length) return;
     this.latestNew = added.at(-1);
@@ -698,9 +867,9 @@ class DiscussionView {
     }
   }
   async ancestorsLoad() {
-    const budget = { left: Config.maxExtraRequests };
+    const budget = { left: this.settings.maxExtraRequests };
     const attempted = new Set();
-    while (budget.left > 0 && this.ancestors < Config.maxAncestors) {
+    while (budget.left > 0 && this.ancestors < this.settings.maxAncestors) {
       const ids = [
         ...new Set(
           [...this.cache.values()]
@@ -710,13 +879,13 @@ class DiscussionView {
       ];
       if (!ids.length) break;
       for (const id of ids) {
-        if (budget.left <= 0 || this.ancestors >= Config.maxAncestors) break;
+        if (budget.left <= 0 || this.ancestors >= this.settings.maxAncestors) break;
         attempted.add(id);
         this.ancestors++;
         try {
           const c = await this.api.get('/api/comments/' + id, budget);
           if (this.disposed) throw abortError();
-          if (this.valid(c) && !this.cache.has(c.id) && this.cache.size < Config.maxComments)
+          if (this.valid(c) && !this.cache.has(c.id) && this.cache.size < this.settings.maxComments)
             this.cache.put(c);
           else this.parentErrors.set(id, 'Комментарий относится к другому обсуждению');
         } catch (e) {
@@ -767,7 +936,23 @@ class DiscussionView {
   }
   render() {
     const anchor = this.anchor();
-    const { parents, children, roots, relations, ambiguous } = graphFor(this.cache);
+    const graph = graphFor(this.cache);
+    const { parents, children, roots, relations, ambiguous } = graph;
+    const visibleRoots = orderThreads(
+      this.cache,
+      graph,
+      this.sort.value,
+      this.filter.value,
+      this.currentUser,
+    );
+    if (this.forumMode) {
+      for (const id of roots) {
+        if (!this.initializedRoots.has(id)) {
+          this.initializedRoots.add(id);
+          if (this.settings.forumCollapsed && children.get(id)?.length) this.collapsed.add(id);
+        }
+      }
+    }
     const rendered = new Set();
     // Reuse comment nodes: only lightweight wrappers are rebuilt, handlers survive.
     for (const n of this.nodes.values()) n.remove();
@@ -788,9 +973,9 @@ class DiscussionView {
         wrap = el('section', 'gnt-branch');
       wrap.dataset.gntId = id;
       wrap.dataset.gntDepth = depth;
-      if (depth > Config.maxDepth) wrap.classList.add('gnt-deep');
+      if (depth > this.settings.maxDepth) wrap.classList.add('gnt-deep');
       wrap.style.marginInlineStart =
-        depth > 0 && depth <= Config.maxDepth ? 'min(20px, 2.5vw)' : '0';
+        depth > 0 && depth <= this.settings.maxDepth ? 'min(20px, 2.5vw)' : '0';
       const tools = el('div', 'gnt-tools');
       let node = this.nodes.get(id);
       if (!node) {
@@ -852,20 +1037,32 @@ class DiscussionView {
             el('span', 'gnt-missing', this.parentErrors.get(p) || 'Родитель не загружен'),
           );
       }
-      if (depth > Config.maxDepth) tools.append(el('span', 'gnt-depth', '↳ глубокая ветка'));
+      if (depth > this.settings.maxDepth) tools.append(el('span', 'gnt-depth', '↳ глубокая ветка'));
       const hidden = count(id);
       if (hidden && !duplicate) {
+        const toggleBranch = () => {
+          this.collapsed.has(id) ? this.collapsed.delete(id) : this.collapsed.add(id);
+          this.render();
+        };
         const toggle = button(
           (this.collapsed.has(id) ? '▸ Раскрыть' : '▾ Свернуть') + ' · ' + hidden,
-          () => {
-            this.collapsed.has(id) ? this.collapsed.delete(id) : this.collapsed.add(id);
-            this.render();
-          },
+          toggleBranch,
         );
         toggle.classList.add('gnt-action');
         toggle.title = hidden + ' известных ответов; полное количество может быть больше';
         toggle.setAttribute('aria-expanded', String(!this.collapsed.has(id)));
         tools.append(toggle);
+        if (this.settings.railToggle && depth <= this.settings.maxDepth) {
+          const rail = button('', toggleBranch);
+          rail.classList.add('gnt-rail-toggle');
+          rail.setAttribute(
+            'aria-label',
+            (this.collapsed.has(id) ? 'Раскрыть' : 'Свернуть') + ' ответы комментария #' + id,
+          );
+          rail.setAttribute('aria-expanded', String(!this.collapsed.has(id)));
+          rail.title = this.collapsed.has(id) ? 'Раскрыть ветку' : 'Свернуть ветку';
+          wrap.append(rail);
+        }
       }
       const original = el('a', 'b-link gnt-permalink', '#' + id);
       original.href = '/comments/' + id;
@@ -899,18 +1096,40 @@ class DiscussionView {
       target.append(wrap);
       if (!duplicate && !this.collapsed.has(id)) {
         const list = children.get(id) || [],
-          limit = this.pages.get(id) || Config.branchPage;
+          limit = this.pages.get(id) || this.settings.visibleReplies;
+        if (list.length && depth >= this.settings.visibleDepth - 1 && !this.expandedDepth.has(id)) {
+          const expand = button('Показать ответы · ' + hidden, () => {
+            this.expandedDepth.add(id);
+            this.render();
+          });
+          expand.classList.add('gnt-show-replies');
+          wrap.append(expand);
+          return;
+        }
         for (const child of list.slice(0, limit)) append(child, wrap, depth + 1);
         if (list.length > limit)
           wrap.append(
             button('Показать ещё известные ответы', () => {
-              this.pages.set(id, limit + Config.branchPage);
+              this.pages.set(id, limit + this.settings.branchPage);
               this.render();
             }),
           );
       }
     };
-    for (const id of roots) append(id, this.tree, 0);
+    for (const id of visibleRoots.slice(0, this.rootLimit)) append(id, this.tree, 0);
+    if (!visibleRoots.length)
+      this.tree.append(el('p', 'gnt-empty', 'Нет подходящих загруженных веток'));
+    if (visibleRoots.length > this.rootLimit) {
+      const moreRoots = button(
+        'Показать ещё обсуждения · ' + (visibleRoots.length - this.rootLimit),
+        () => {
+          this.rootLimit += this.forumMode ? this.settings.forumRoots : this.settings.visibleRoots;
+          this.render();
+        },
+      );
+      moreRoots.classList.add('gnt-show-replies');
+      this.tree.append(moreRoots);
+    }
     for (const n of this.nodes.values())
       if (n.dataset.gntNew) {
         try {
@@ -950,6 +1169,7 @@ class DiscussionView {
     this.focus(id);
   }
   focus(id) {
+    this.filter.value = 'all';
     const { parents } = graphFor(this.cache);
     const pending = [id],
       seen = new Set();
@@ -959,10 +1179,12 @@ class DiscussionView {
       seen.add(n);
       for (const p of parents.get(n) || []) {
         this.collapsed.delete(p);
-        this.pages.set(p, Config.maxComments);
+        this.expandedDepth.add(p);
+        this.pages.set(p, this.settings.maxComments);
         pending.push(p);
       }
     }
+    this.rootLimit = this.settings.maxComments;
     this.render();
     const wrap = this.tree.querySelector('[data-gnt-id="' + id + '"]');
     if (wrap) {
@@ -973,7 +1195,7 @@ class DiscussionView {
   }
   async newer() {
     if (this.loading || this.mode !== 'tree' || !this.ready) return;
-    if (this.cache.size >= Config.maxComments) {
+    if (this.cache.size >= this.settings.maxComments) {
       this.status.textContent =
         'Достигнут лимит памяти. Обновите страницу для загрузки свежих комментариев.';
       return;
@@ -985,12 +1207,12 @@ class DiscussionView {
     const known = new Set(this.cache.keys());
     try {
       if (this.descriptor.template) {
-        const data = await this.api.get(nativeUrl(this.descriptor, 0, Config.initial), {
-          left: Config.maxExtraRequests,
+        const data = await this.api.get(nativeUrl(this.descriptor, 0, this.settings.initial), {
+          left: this.settings.maxExtraRequests,
         });
         if (this.disposed) return;
         if (typeof data.content !== 'string') throw Error('Неожиданный формат HTML API');
-        this.ingest(data, Config.initial);
+        this.ingest(data, this.settings.initial);
       } else {
         const list = await this.api.get(
           '/api/comments?commentable_id=' +
@@ -998,7 +1220,7 @@ class DiscussionView {
             '&commentable_type=' +
             encodeURIComponent(this.type) +
             '&limit=30&page=1',
-          { left: Config.maxExtraRequests },
+          { left: this.settings.maxExtraRequests },
         );
         if (this.disposed) return;
         if (!Array.isArray(list)) throw Error('Неожиданный формат API');
@@ -1016,14 +1238,14 @@ class DiscussionView {
           .at(-1);
         this.jumpNew.textContent = 'К новым · ' + added.length;
         this.jumpNew.hidden = false;
-        this.nextSkip = Config.initial;
+        this.nextSkip = this.settings.initial;
         this.more.disabled = !this.descriptor.template;
       }
       if (this.mode === 'tree') this.render();
       this.status.textContent = added.length
         ? 'Добавлено новых: ' +
           added.length +
-          (this.cache.size >= Config.maxComments ? ' · достигнут лимит памяти' : '')
+          (this.cache.size >= this.settings.maxComments ? ' · достигнут лимит памяти' : '')
         : 'Новых комментариев нет';
     } catch (error) {
       if (!this.disposed)
@@ -1038,7 +1260,7 @@ class DiscussionView {
   }
   async older() {
     if (this.loading || this.mode !== 'tree' || !this.descriptor.template) return;
-    const remaining = Config.maxComments - this.cache.size;
+    const remaining = this.settings.maxComments - this.cache.size;
     if (remaining <= 0) {
       this.status.textContent = 'Достигнут лимит памяти обсуждения';
       return;
@@ -1047,9 +1269,9 @@ class DiscussionView {
     this.more.disabled = true;
     this.moreTop.disabled = true;
     try {
-      const limit = Math.min(Config.branchPage, remaining);
+      const limit = Math.min(this.settings.branchPage, remaining);
       const data = await this.api.get(nativeUrl(this.descriptor, this.nextSkip, limit), {
-        left: Config.maxExtraRequests,
+        left: this.settings.maxExtraRequests,
       });
       if (this.disposed) return;
       if (typeof data.content !== 'string') throw Error('Неожиданный формат HTML API');
@@ -1057,7 +1279,7 @@ class DiscussionView {
       this.ingest(data, limit);
       await this.ancestorsLoad();
       this.nextSkip += limit;
-      this.more.disabled = count < limit || this.cache.size >= Config.maxComments;
+      this.more.disabled = count < limit || this.cache.size >= this.settings.maxComments;
       if (this.mode === 'tree') this.render();
     } catch (error) {
       if (!this.disposed) {
@@ -1081,11 +1303,11 @@ class DiscussionView {
       try {
         this.navigationId = id;
         const c = await this.api.get('/api/comments/' + id, {
-          left: Config.maxExtraRequests,
+          left: this.settings.maxExtraRequests,
         });
         if (this.valid(c)) {
           if (this.disposed) return;
-          if (this.cache.size >= Config.maxComments) {
+          if (this.cache.size >= this.settings.maxComments) {
             this.status.textContent = 'Достигнут лимит памяти обсуждения';
             return;
           }
@@ -1109,12 +1331,15 @@ class DiscussionView {
     this.latestNew = null;
     this.jumpNew.hidden = true;
     this.pages.clear();
+    this.expandedDepth.clear();
+    this.rootLimit = this.forumMode ? this.settings.forumRoots : this.settings.visibleRoots;
     this.collapsed.clear();
+    this.initializedRoots.clear();
     this.parentErrors.clear();
     this.ready = false;
     this.needsAncestors = true;
     this.ancestors = 0;
-    this.nextSkip = Config.initial;
+    this.nextSkip = this.settings.initial;
     this.more.disabled = false;
   }
   async switch(mode, remember = true) {
@@ -1122,6 +1347,7 @@ class DiscussionView {
     this.mode = mode;
     this.more.hidden = mode !== 'tree';
     this.topActions.hidden = mode !== 'tree';
+    this.options.hidden = mode !== 'tree';
     try {
       if (remember) localStorage.setItem(KEY, mode);
     } catch {
@@ -1146,7 +1372,7 @@ class DiscussionView {
     try {
       if (
         this.ready &&
-        [...this.cache.values()].some((c) => Date.now() - c.gntTime >= Config.ttl)
+        [...this.cache.values()].some((c) => Date.now() - c.gntTime >= this.settings.ttl)
       ) {
         this.reset();
       }
@@ -1197,8 +1423,186 @@ style.dataset.gntStyle = '1';
 style.textContent = STYLES;
 document.head.append(style);
 let suspended = false;
+function initSettings() {
+  const nav = document.querySelector('.is-own-profile > .b-options-floated');
+  if (!nav || !/^\/[^/]+\/edit\//.test(location.pathname)) return;
+  const base = location.pathname.match(/^(\/[^/]+\/edit\/)/)?.[1];
+  if (!base) return;
+  const settingsPath = base + 'gnt-settings';
+  if (location.hash === '#gnt-settings') {
+    history.replaceState(history.state, '', settingsPath);
+  }
+  let link = nav.querySelector('.gnt-settings-link');
+  if (!link) {
+    link = el('a', 'gnt-settings-link', 'Ветки комментариев');
+    link.href = settingsPath;
+    link.addEventListener('click', (event) => {
+      if (event.button !== 0 || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)
+        return;
+      event.preventDefault();
+      history.pushState(history.state, '', settingsPath);
+      initSettings();
+    });
+    nav.append(link);
+  }
+  const container = nav.parentElement;
+  const active = location.pathname.replace(/\/$/, '') === settingsPath;
+  let panel = container.querySelector(':scope > .gnt-settings');
+  if (active && !panel) {
+    panel = el('div', 'gnt-settings');
+    panel.append(el('h2', 'subheadline', 'Настройки веток комментариев'));
+    const form = el('form', 'gnt-settings-form');
+    const saved = readSettings();
+    const fields = [
+      ['visibleRoots', 'Веток на других страницах', 100, 1, 'Отображение'],
+      ['forumRoots', 'Веток на страницах форума', 100, 1],
+      ['visibleReplies', 'Ответов на одном уровне', 100, 1],
+      ['visibleDepth', 'Уровней до ручного раскрытия', 20, 1],
+      ['maxDepth', 'Максимальная глубина отступов', 20, 1],
+      ['branchPage', 'Порция старых комментариев и дополнительных ответов', 100, 1],
+      ['initial', 'Начальная загрузка комментариев', 100, 1, 'Загрузка и память'],
+      ['maxComments', 'Максимум комментариев в обсуждении', 500, 1],
+      ['maxAncestors', 'Автоматически проверяемых предков', 100, 0],
+      ['maxExtraRequests', 'Дополнительных запросов за загрузку', 100, 0],
+      ['ttl', 'Время жизни кэша, мс', 86400000, 1000],
+      ['concurrency', 'Одновременных запросов на странице', 4, 1, 'Сеть'],
+      ['timeout', 'Тайм-аут запроса, мс', 60000, 1000],
+      ['retries', 'Повторных попыток', 5, 0],
+      ['maxRetryDelay', 'Максимальное ожидание повтора, мс', 60000, 0],
+    ];
+    for (const [name, label, max, min, group] of fields) {
+      if (group) form.append(el('h3', 'gnt-settings-group', group));
+      const row = el('label', 'gnt-settings-row');
+      row.append(el('span', '', label));
+      const input = el('input');
+      input.type = 'number';
+      input.name = name;
+      input.min = String(min);
+      input.max = String(max);
+      input.required = true;
+      input.value = String(saved[name]);
+      row.append(input);
+      form.append(row);
+    }
+    form.append(el('h3', 'gnt-settings-group', 'Поведение'));
+    const selects = [
+      [
+        'defaultMode',
+        'Режим при открытии',
+        [
+          ['remember', 'Запоминать выбор'],
+          ['chronology', 'Хронология'],
+          ['tree', 'Ветки'],
+        ],
+      ],
+      [
+        'defaultSort',
+        'Сортировка по умолчанию',
+        [
+          ['new', 'Новые ветки'],
+          ['activity', 'Последняя активность'],
+          ['count', 'Больше ответов'],
+        ],
+      ],
+      [
+        'defaultFilter',
+        'Фильтр по умолчанию',
+        [
+          ['all', 'Все ветки'],
+          ['mine', 'Я участвовал'],
+          ['mentions', 'Меня упоминали'],
+          ['either', 'Участие или упоминание'],
+        ],
+      ],
+    ];
+    for (const [name, label, choices] of selects) {
+      const row = el('label', 'gnt-settings-row');
+      row.append(el('span', '', label));
+      const select = el('select');
+      select.name = name;
+      for (const [value, text] of choices) {
+        const option = el('option', '', text);
+        option.value = value;
+        select.append(option);
+      }
+      select.value = saved[name];
+      row.append(select);
+      form.append(row);
+    }
+    const checks = [
+      ['forumCollapsed', 'Сворачивать ответы на страницах форума'],
+      ['autoMultiple', 'Автоматически включать ветки при нескольких обсуждениях'],
+      ['railToggle', 'Сворачивать ветки нажатием на линию'],
+    ];
+    for (const [name, label] of checks) {
+      const row = el('label', 'gnt-settings-check');
+      const input = el('input');
+      input.type = 'checkbox';
+      input.name = name;
+      input.checked = saved[name];
+      row.append(input, document.createTextNode(' ' + label));
+      form.append(row);
+    }
+    const submit = button('Сохранить', () => {});
+    submit.type = 'submit';
+    const reset = button('Восстановить defaults', () => {
+      const defaults = normalizeSettings();
+      for (const [name] of fields) form.elements[name].value = defaults[name];
+      for (const [name] of selects) form.elements[name].value = defaults[name];
+      for (const [name] of checks) form.elements[name].checked = defaults[name];
+    });
+    reset.textContent = 'По умолчанию';
+    const message = el('p', 'gnt-settings-message');
+    message.setAttribute('role', 'status');
+    form.append(submit, reset, message);
+    form.addEventListener('submit', (event) => {
+      event.preventDefault();
+      const values = Object.fromEntries(fields.map(([name]) => [name, form.elements[name].value]));
+      for (const [name] of selects) values[name] = form.elements[name].value;
+      for (const [name] of checks) values[name] = form.elements[name].checked;
+      try {
+        localStorage.setItem(SETTINGS_KEY, JSON.stringify(normalizeSettings(values)));
+        message.textContent =
+          'Сохранено. Обновите страницы с обсуждениями, чтобы применить настройки.';
+      } catch {
+        message.textContent = 'Не удалось сохранить настройки браузера.';
+      }
+    });
+    panel.append(
+      form,
+      el(
+        'p',
+        'gnt-settings-hint',
+        'Настройки сохраняются в этом браузере отдельно для каждого домена.',
+      ),
+    );
+    container.append(panel);
+  }
+  if (panel) panel.hidden = !active;
+  for (const child of container.children) {
+    if (child === nav || child === panel) continue;
+    if (active && !child.hasAttribute('data-gnt-settings-hidden')) {
+      child.dataset.gntSettingsHidden = child.hidden ? '1' : '0';
+      child.hidden = true;
+    } else if (!active && child.hasAttribute('data-gnt-settings-hidden')) {
+      child.hidden = child.dataset.gntSettingsHidden === '1';
+      delete child.dataset.gntSettingsHidden;
+    }
+  }
+  for (const a of nav.querySelectorAll('a:not(.gnt-settings-link)')) {
+    if (active && a.classList.contains('selected')) {
+      a.dataset.gntSelected = '1';
+      a.classList.remove('selected');
+    } else if (!active && a.dataset.gntSelected) {
+      a.classList.add('selected');
+      delete a.dataset.gntSelected;
+    }
+  }
+  link.classList.toggle('selected', active);
+}
 function init() {
   if (suspended) return;
+  initSettings();
   const route = location.pathname + location.search;
   for (const [host, view] of sessions)
     if (!host.isConnected || view.route !== route) {
